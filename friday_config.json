@@ -1,0 +1,32 @@
+{
+  "assistant_name": "Friday",
+  "wake_word": "hey friday",
+
+  "porcupine_access_key": "NtoXZLPLnDTJ8a0CnjXZg9UpeOHI/V2I3hFQX+bsAvtqvRujBGAufg==",
+  "porcupine_keyword_path": "C:\\Friday-ai\\{assets,data,logs}\\Hey-Friday\\Hey-Friday.ppn",
+
+  "voice_language": "en-US",
+  "speech_timeout": 5,
+  "speech_phrase_limit": 10,
+
+  "enable_wake_word": true,
+  "enable_voice_input": true,
+  "enable_voice_output": false,
+
+  "log_level": "INFO",
+
+  "gui_theme": "dark",
+  "gui_width": 960,
+  "gui_height": 680,
+
+  "search_root_dirs": [
+    "~\\Desktop",
+    "~\\Documents",
+    "~\\Downloads",
+    "~\\Pictures",
+    "~"
+  ],
+
+  "browser_path": "",
+  "text_editor_path": ""
+}

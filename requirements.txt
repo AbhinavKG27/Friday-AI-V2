@@ -1,0 +1,20 @@
+# Friday AI Assistant – Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# ---- Core (required) ----
+# tkinter is bundled with Python – no pip install needed
+
+# ---- Voice Input ----
+SpeechRecognition>=3.10.0      # Microphone capture + speech-to-text
+pyaudio>=0.2.14                # Audio I/O (required by SpeechRecognition)
+
+# ---- Wake Word (optional – needs Picovoice account) ----
+pvporcupine>=3.0.0             # Wake word detection engine
+# pyaudio is also needed for Porcupine (already listed above)
+
+# ---- System Automation (optional but recommended) ----
+psutil>=5.9.0                  # CPU / RAM / disk / battery stats
+Pillow>=10.0.0                 # Screenshot support (ImageGrab)
+
+# ---- Offline Speech Recognition (optional fallback) ----
+# PocketSphinx>=5.0.0          # Uncomment for fully-offline speech recognition
