@@ -275,6 +275,8 @@ class ConversationManager:
         self._cb_status("🎙️ Listening… (say 'Friday exit' to stop)")
 
         # Start microphone capture on background thread
+        # Ensure TTS finished before opening mic
+        time.sleep(0.2)
         self._open_mic()
 
         # Block until voice thread delivers a result (or timeout)
@@ -355,6 +357,8 @@ class ConversationManager:
         """Wait for a yes/no confirmation answer."""
         self._reset_speech()
         self._cb_status("🎙️ Waiting for your answer…")
+        # Ensure TTS finished before opening mic
+        time.sleep(0.2)
         self._open_mic()
 
         got = self._speech_evt.wait(timeout=FOLLOWUP_LISTEN_TIMEOUT)
@@ -476,13 +480,27 @@ class ConversationManager:
         """
         Start one capture cycle on the Friday-Voice thread.
         Results land in _on_voice_ok / _on_voice_err.
-        If voice is unavailable, the GUI text box is the fallback.
+
+        IMPORTANT:
+        Prevent opening a new microphone capture if the previous
+        capture thread is still running. This avoids the
+        'Previous capture thread still alive' issue.
         """
-        if self.voice and self.voice.is_available:
-            self.voice.listen_once_with_callbacks(
-                on_result=self._on_voice_ok,
-                on_error=self._on_voice_err,
-            )
+        if not self.voice or not self.voice.is_available:
+            return
+
+        try:
+            # If voice module exposes a busy flag, respect it
+            if hasattr(self.voice, "is_listening") and self.voice.is_listening:
+                self._log.debug("Voice capture already active — skipping mic open")
+                return
+        except Exception:
+            pass
+
+        self.voice.listen_once_with_callbacks(
+            on_result=self._on_voice_ok,
+            on_error=self._on_voice_err,
+        )
 
     def _on_voice_ok(self, text: str):
         """Called by Friday-Voice thread — recognition succeeded."""
