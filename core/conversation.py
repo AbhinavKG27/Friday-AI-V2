@@ -129,6 +129,8 @@ class ConversationManager:
         config,
         on_state_change: Optional[Callable[[ConvState], None]] = None,
         on_status:       Optional[Callable[[str], None]]       = None,
+        on_standby:      Optional[Callable[[], None]]          = None,
+        on_reactivate:   Optional[Callable[[], None]]          = None,
     ):
         self._log    = logging.getLogger("Friday.Conversation")
         self.asst    = assistant
@@ -139,7 +141,8 @@ class ConversationManager:
 
         self._cb_state  = on_state_change or (lambda s: None)
         self._cb_status = on_status       or (lambda t: None)
-
+        self._cb_standby = on_standby     or (lambda: None)
+        self._cb_reactivate = on_reactivate or (lambda: None)
         self._state  = ConvState.IDLE
         self._lock   = threading.Lock()
 
@@ -186,6 +189,7 @@ class ConversationManager:
                 ConvState.CONVERSATION_END,
             ):
                 self._log.info("Wake triggered")
+                self._cb_reactivate()
                 self._set_state(ConvState.GREETING)
                 self._speech_evt.set()   # unblock _state_wake_listening()
 
@@ -420,8 +424,12 @@ class ConversationManager:
             response = result.message
 
             # Single dispatch call → log + GUI display + TTS voice
-            self.bus.set_block(False)
+            # Speak the full answer before opening the microphone again,
+            # so conversations feel natural and Friday does not capture its
+            # own TTS output as the next command.
+            self.bus.set_block(True)
             self.bus.say(response)
+            self.bus.set_block(False)
 
         except Exception as exc:
             self._log.error("Execute error for '%s': %s", cmd_text, exc, exc_info=True)
@@ -442,8 +450,13 @@ class ConversationManager:
     # ═══════════════════════════════════════════
 
     def _state_do_exit(self):
+        self.bus.set_block(True)
+        self.bus.say(
+            "Going to standby voice mode. I will keep listening in the background. "
+            "Say 'Hey Friday' to bring me back."
+        )
         self.bus.set_block(False)
-        self.bus.say("Going back to standby. Say 'Hey Friday' whenever you need me.")
+        self._cb_standby()
         self._cb_status("👂 Listening for 'Hey Friday'…")
         with self._lock:
             self._pending_cmd = None

@@ -32,6 +32,7 @@ import logging
 import threading
 import queue
 import re
+import unicodedata
 from typing import Optional, Callable
 
 
@@ -48,10 +49,24 @@ _CLEAN = [
     (re.compile(r"\s+([,\.!?])\s*"),          r"\1 "),
 ]
 
+_PUNCT_TRANSLATE = str.maketrans({
+    "…": "...",
+    "’": "'",
+    "‘": "'",
+    "“": '"',
+    "”": '"',
+    "–": "-",
+    "—": "-",
+})
 
 def _clean(text: str) -> str:
+    text = text.translate(_PUNCT_TRANSLATE)
     for pat, rep in _CLEAN:
         text = pat.sub(rep, text)
+    # pyttsx3/SAPI can fail on some Unicode symbols depending on voice pack.
+    # Force a plain-ASCII fallback so command replies are always spoken.
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"\s{2,}", " ", text)
     return text.strip(" .")
 
 

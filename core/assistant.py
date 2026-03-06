@@ -223,6 +223,9 @@ class FridayAssistant:
         # Specific apps
         app_aliases = {
             "chrome": "chrome",
+            "brave": "brave",
+            "brave browser": "brave",
+            "google": "chrome",
             "google chrome": "chrome",
             "firefox": "firefox",
             "edge": "msedge",

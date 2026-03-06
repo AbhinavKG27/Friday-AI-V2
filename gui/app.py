@@ -92,6 +92,7 @@ class FridayApp:
         self._bus            = None
         self._cmd_history    = []
         self._hist_idx       = -1
+        self._hidden_standby = False
 
         self._setup_window()
         self._build_ui()
@@ -373,6 +374,8 @@ class FridayApp:
             config=self.config,
             on_state_change=self._on_state_change,
             on_status=lambda m: self.root.after(0, self._set_status, m),
+            on_standby=lambda: self.root.after(0, self._enter_background_mode),
+            on_reactivate=lambda: self.root.after(0, self._reactivate_window),
         )
 
         # Start wake detector BEFORE ConvMgr so it's ready when needed
@@ -526,8 +529,27 @@ class FridayApp:
             "Friday is running.\n"
             "Say 'Hey Friday' to activate voice mode, "
             "or click 🎙️ Activate / type below.\n"
-            "Say 'Friday exit' to return to standby."
+            "Say 'Friday exit' to hide the window and keep standby listening."
         ))
+    
+    def _enter_background_mode(self):
+        """
+        Hide the window but keep Friday running in wake-listening standby.
+        Triggered by the voice phrase "Friday exit".
+        """
+        if self._hidden_standby:
+            return
+        self._hidden_standby = True
+        self.root.withdraw()
+
+    def _reactivate_window(self):
+        """Restore the hidden window when wake-word activation happens."""
+        if not self._hidden_standby:
+            return
+        self._hidden_standby = False
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     def _divider(self, parent):
         tk.Frame(parent, bg=C["border"], height=1).pack(fill=tk.X, padx=10)
