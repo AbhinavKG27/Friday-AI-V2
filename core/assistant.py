@@ -38,6 +38,10 @@ class FridayAssistant:
         self._response_callback: Optional[Callable[[CommandResult], None]] = None
         self._status_callback: Optional[Callable[[str], None]] = None
 
+        # Flag set by ConversationManager during active execution
+        # to suppress the legacy GUI response callback (prevents duplicate display)
+        self._conv_active: bool = False
+
         # Start reminder background thread
         self.reminders.start()
 
@@ -90,7 +94,7 @@ class FridayAssistant:
 
         # ---- Greetings / meta ----
         if contains_any(n, ["hello", "hi friday", "hey", "good morning", "good evening"]):
-            return CommandResult.ok(cmd, "Hello! I'm Friday, your AI assistant. How can I help you today?")
+            return CommandResult.ok(cmd, "Hello! How can I help you?")
 
         if contains_any(n, ["who are you", "what are you", "what can you do"]):
             return CommandResult.ok(cmd, self._capabilities_text())
@@ -189,7 +193,10 @@ class FridayAssistant:
             return self.automation.open_app(cmd, "notepad")
 
         # ---- Unknown ----
-        return CommandResult.unknown(cmd)
+        return CommandResult.ok(
+            cmd,
+            "I don't know how to do that yet. Try saying 'what can you do' for a list of commands."
+        )
 
     # ------------------------------------------------------------------ #
     # Sub-routers
@@ -247,6 +254,13 @@ class FridayAssistant:
             "terminal": "wt",
             "windows terminal": "wt",
             "snipping tool": "snippingtool",
+            "camera": "microsoft.windows.camera:",
+            "webcam": "microsoft.windows.camera:",
+            "mail": "outlookmail:",
+            "email": "outlookmail:",
+            "weather": "bingweather:",
+            "news": "bingnews:",
+            "feedback": "windows-feedback:",
             "paint 3d": "paint3d",
             "photos": "ms-photos:",
             "calendar": "outlookcal:",

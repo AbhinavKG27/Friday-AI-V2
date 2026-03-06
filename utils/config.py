@@ -1,6 +1,11 @@
 """
 utils/config.py
-Centralized configuration management for Friday.
+Centralised configuration management for Friday.
+
+KEY CHANGE (v4)
+---------------
+enable_voice_output now defaults to True.
+The old default of False was the primary reason TTS was never triggered.
 """
 
 import os
@@ -10,33 +15,41 @@ import logging
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DEFAULTS = {
-    "assistant_name": "Friday",
-    "wake_word": "hey friday",
-    "porcupine_access_key": "",          # Fill in your Picovoice key
-    "porcupine_keyword_path": "",        # Path to custom .ppn file (optional)
-    "voice_language": "en-US",
-    "speech_timeout": 5,
-    "speech_phrase_limit": 10,
-    "log_level": "INFO",
-    "log_dir": os.path.join(BASE_DIR, "logs"),
-    "data_dir": os.path.join(BASE_DIR, "data"),
-    "reminders_file": os.path.join(BASE_DIR, "data", "reminders.json"),
-    "command_history_file": os.path.join(BASE_DIR, "data", "history.json"),
-    "gui_theme": "dark",
-    "gui_width": 900,
-    "gui_height": 650,
-    "max_history_display": 200,
+    "assistant_name":          "Friday",
+    "wake_word":               "hey friday",
+    "porcupine_access_key":    "",
+    "porcupine_keyword_path":  "",
+    "voice_language":          "en-US",
+    "speech_timeout":          6,
+    "speech_phrase_limit":     12,
+    "log_level":               "INFO",
+    "log_dir":                 os.path.join(BASE_DIR, "logs"),
+    "data_dir":                os.path.join(BASE_DIR, "data"),
+    "reminders_file":          os.path.join(BASE_DIR, "data", "reminders.json"),
+    "command_history_file":    os.path.join(BASE_DIR, "data", "history.json"),
+    "gui_theme":               "dark",
+    "gui_width":               980,
+    "gui_height":              700,
+    "max_history_display":     200,
     "search_root_dirs": [
         os.path.expanduser("~\\Desktop"),
         os.path.expanduser("~\\Documents"),
         os.path.expanduser("~\\Downloads"),
         os.path.expanduser("~"),
     ],
-    "browser_path": "",   # Auto-detected if empty
-    "text_editor_path": "",
-    "enable_wake_word": True,
-    "enable_voice_input": True,
-    "enable_voice_output": False,   # TTS optional
+    "browser_path":            "",
+    "text_editor_path":        "",
+    # ── Voice flags ────────────────────────────────────────────────────
+    "enable_wake_word":        True,
+    "enable_voice_input":      True,
+    "enable_voice_output":     True,   # FIX: was False — this disabled all TTS
+    # ── TTS settings ───────────────────────────────────────────────────
+    "tts_rate":                170,
+    "tts_volume":              0.95,
+    "tts_voice_gender":        "female",
+    # ── Conversation timeouts ──────────────────────────────────────────
+    "conv_listen_timeout":     12,
+    "conv_max_failures":       3,
 }
 
 
@@ -50,7 +63,6 @@ class Config:
         self._load()
         self._ensure_dirs()
 
-    # ------------------------------------------------------------------ #
     def _load(self):
         if os.path.exists(self.CONFIG_FILE):
             try:
@@ -59,10 +71,10 @@ class Config:
                 self._data.update(user_cfg)
             except Exception as e:
                 logging.getLogger("Friday.Config").warning(
-                    "Could not load config file: %s – using defaults", e
+                    "Could not load config file: %s — using defaults", e
                 )
         else:
-            self.save()   # write defaults on first run
+            self.save()
 
     def save(self):
         try:
@@ -75,7 +87,6 @@ class Config:
         for key in ("log_dir", "data_dir"):
             os.makedirs(self._data[key], exist_ok=True)
 
-    # ------------------------------------------------------------------ #
     def get(self, key, default=None):
         return self._data.get(key, default)
 

@@ -1,29 +1,44 @@
 """
-core/conversation.py
-Conversation State Machine for Friday.
+core/conversation.py  —  Friday v4
+=====================================
+Conversation state machine.
 
-States:
-  IDLE              — system is running, not actively doing anything
-  WAKE_LISTENING    — continuously monitoring mic for "hey friday"
-  GREETING          — wake word just detected, playing greeting
-  COMMAND_LISTENING — listening for the user's command
-  PROCESSING        — command received, being dispatched
-  AWAITING_INPUT    — assistant asked a follow-up question, waiting for answer
-  EXECUTING         — long-running task in progress
-  CONVERSATION_END  — user said "friday exit", returning to WAKE_LISTENING
+Every output — greeting, command response, error message, exit farewell —
+flows through MessageBus.dispatch() which writes to log, GUI and TTS in
+one atomic call. Nothing can appear in the log without appearing in the
+GUI, and nothing Friday says can be unspoken.
 
-Fixes applied (v2.1):
-  1. Double response eliminated — assistant.process_command() result is ONLY
-     displayed via _on_assistant_speech; the legacy GUI callback is suppressed
-     during active conversation so responses never appear twice.
-  2. Wake-word phrases ("hey friday", "hi", etc.) are silently ignored when
-     they arrive as voice input inside COMMAND_LISTENING — they are artefacts
-     of the mic picking up residual audio after wake detection.
-  3. After executing a command Friday stays in COMMAND_LISTENING so the user
-     can immediately issue a follow-up without saying "Hey Friday" again.
-     Only a timeout OR an explicit exit phrase returns to WAKE_LISTENING.
-  4. Timeout while in COMMAND_LISTENING — after CONVERSATION_IDLE_TIMEOUT
-     seconds of silence, Friday says a polite goodbye and returns to standby.
+STATE MACHINE
+─────────────
+  IDLE
+    │  start()
+    ▼
+  WAKE_LISTENING  ◄────────────────────────────────────┐
+    │  wake word / Activate button                     │
+    ▼                                                  │
+  GREETING                                             │
+    │  greeting spoken (blocking TTS)                  │
+    ▼                                                  │
+  COMMAND_LISTENING  ◄──────────────────────────────┐  │
+    │  speech recognised                            │  │
+    ▼                                               │  │
+  PROCESSING                                        │  │
+    │  safe cmd ──────────► EXECUTING               │  │
+    │  dangerous cmd ──────► AWAITING_INPUT ─► yes ─┘  │
+    │                                        ─► no ─┘  │
+    ▼  (after execution)                              │
+  COMMAND_LISTENING (loop)                           │
+    │  "friday exit" / timeout                       │
+    ▼                                                │
+  CONVERSATION_END ─────────────────────────────────┘
+
+THREAD MODEL
+────────────
+  Friday-ConvMgr  — this file's _loop()
+  Friday-WakeWord — pvporcupine / software spotter
+  Friday-TTS      — pyttsx3 worker queue
+  Friday-Voice    — SpeechRecognition capture
+  Tk main thread  — GUI (all Tk calls go via root.after)
 """
 
 import logging
@@ -32,6 +47,12 @@ import time
 from enum import Enum, auto
 from typing import Callable, Optional
 
+from core.message_bus import MessageBus
+
+
+# ═══════════════════════════════════════════════
+# States
+# ═══════════════════════════════════════════════
 
 class ConvState(Enum):
     IDLE              = auto()
@@ -44,9 +65,9 @@ class ConvState(Enum):
     CONVERSATION_END  = auto()
 
 
-# ------------------------------------------------------------------ #
+# ═══════════════════════════════════════════════
 # Constants
-# ------------------------------------------------------------------ #
+# ═══════════════════════════════════════════════
 
 CONFIRMATION_TRIGGERS = [
     "delete", "remove", "shutdown", "shut down", "restart", "reboot",
@@ -61,422 +82,435 @@ NO_PHRASES = [
     "no", "nope", "cancel", "abort", "don't", "negative", "back off",
 ]
 
+# Any of these phrases ends the conversation and returns to standby
 EXIT_PHRASES = [
     "friday exit", "exit friday", "goodbye friday", "bye friday",
     "stop listening", "that's all", "that is all", "dismiss",
 ]
 
-# Phrases to silently ignore — wake-word artefacts / pure noise
+# Artefacts from wake-word audio bleed — drop without responding
 IGNORE_PHRASES = {
     "hey friday", "hi friday", "hello friday", "ok friday", "okay friday",
-    "hey", "hi", "hello", "friday",
+    "hey", "hi", "hello", "friday", "",
 }
 
-# After this many seconds of silence in COMMAND_LISTENING, go to standby
-CONVERSATION_IDLE_TIMEOUT = 15   # seconds
+COMMAND_LISTEN_TIMEOUT  = 12   # s — no speech at all → return to standby
+FOLLOWUP_LISTEN_TIMEOUT = 14   # s — no answer to confirmation → cancel
+MAX_FAILURES            =  3   # consecutive recognition failures → standby
 
 
-# ------------------------------------------------------------------ #
+# ═══════════════════════════════════════════════
 # ConversationManager
-# ------------------------------------------------------------------ #
+# ═══════════════════════════════════════════════
 
 class ConversationManager:
     """
-    Drives the full voice interaction loop as a state machine.
+    Drives the full voice-interaction loop.
 
-    Key design:
-    - Runs entirely on ONE background thread (Friday-ConvMgr).
-    - Voice capture runs on a separate daemon thread (Friday-VoiceCapture).
-    - GUI updates are fired via callbacks — callers must schedule them on
-      the Tkinter main thread (e.g. root.after(0, cb, arg)).
-    - assistant.process_command() is called synchronously on the ConvMgr
-      thread so results are available immediately after execution.
-    - The legacy assistant response callback is intentionally NOT used here
-      to prevent duplicate messages in the GUI.
+    All output goes through the MessageBus — never directly to TTS or GUI.
+
+    Parameters
+    ----------
+    assistant       : FridayAssistant
+    bus             : MessageBus
+    voice_listener  : VoiceListener
+    wake_detector   : WakeWordDetector | None
+    config          : Config
+    on_state_change : Callable[[ConvState], None]  — GUI state indicator
+    on_status       : Callable[[str], None]        — GUI status text
     """
 
     def __init__(
         self,
         assistant,
-        tts,
+        bus:             MessageBus,
         voice_listener,
         wake_detector,
         config,
-        on_state_change:     Optional[Callable[[ConvState], None]] = None,
-        on_user_speech:      Optional[Callable[[str], None]] = None,
-        on_assistant_speech: Optional[Callable[[str], None]] = None,
-        on_status:           Optional[Callable[[str], None]] = None,
+        on_state_change: Optional[Callable[[ConvState], None]] = None,
+        on_status:       Optional[Callable[[str], None]]       = None,
     ):
-        self.logger   = logging.getLogger("Friday.Conversation")
-        self.assistant = assistant
-        self.tts       = tts
-        self.voice     = voice_listener
-        self.wake      = wake_detector
-        self.config    = config
+        self._log    = logging.getLogger("Friday.Conversation")
+        self.asst    = assistant
+        self.bus     = bus
+        self.voice   = voice_listener
+        self.wake    = wake_detector
+        self.cfg     = config
 
-        # Callbacks (must be thread-safe — schedule on main thread by caller)
-        self._on_state_change     = on_state_change     or (lambda s: None)
-        self._on_user_speech      = on_user_speech      or (lambda t: None)
-        self._on_assistant_speech = on_assistant_speech or (lambda t: None)
-        self._on_status           = on_status           or (lambda t: None)
+        self._cb_state  = on_state_change or (lambda s: None)
+        self._cb_status = on_status       or (lambda t: None)
 
-        self._state      = ConvState.IDLE
-        self._state_lock = threading.Lock()
+        self._state  = ConvState.IDLE
+        self._lock   = threading.Lock()
 
-        self._pending_command: Optional[str] = None
-        self._pending_prompt:  Optional[str] = None
+        self._pending_cmd: Optional[str] = None
+        self._pending_ctx: Optional[str] = None
 
-        # Single event used to pass speech results into the state machine
-        self._speech_result: Optional[str] = None
-        self._speech_error:  Optional[str] = None
-        self._speech_ready   = threading.Event()
+        # Speech result — written by Friday-Voice thread, read by ConvMgr
+        self._speech_text:  Optional[str] = None
+        self._speech_error: Optional[str] = None
+        self._speech_evt    = threading.Event()
 
+        self._fail_count  = 0
         self._running     = False
-        self._main_thread: Optional[threading.Thread] = None
+        self._thread: Optional[threading.Thread] = None
 
-    # ================================================================== #
-    # Lifecycle
-    # ================================================================== #
+    # ═══════════════════════════════════════════
+    # Public API
+    # ═══════════════════════════════════════════
 
     def start(self):
+        """Start the state machine — enters WAKE_LISTENING immediately."""
         self._running = True
-        self._main_thread = threading.Thread(
-            target=self._main_loop, daemon=True, name="Friday-ConvMgr"
+        self._thread  = threading.Thread(
+            target=self._loop, daemon=True, name="Friday-ConvMgr"
         )
-        self._main_thread.start()
-        self.logger.info("ConversationManager started")
+        self._thread.start()
+        self._log.info("ConversationManager started")
 
     def stop(self):
+        """Graceful shutdown."""
         self._running = False
-        self._speech_ready.set()
-        self.logger.info("ConversationManager stopped")
-
-    # ================================================================== #
-    # External triggers
-    # ================================================================== #
+        self._speech_evt.set()
+        self._log.info("ConversationManager stopped")
 
     def trigger_wake(self):
         """
-        Called by WakeWordDetector or the GUI 'Activate' button.
-        Only transitions when we are truly idle (not mid-conversation).
+        Called by WakeWordDetector or the GUI Activate button.
+        Only acts when the system is in a true idle/standby state.
         """
-        with self._state_lock:
-            if self._state in (ConvState.WAKE_LISTENING, ConvState.IDLE,
-                               ConvState.CONVERSATION_END):
-                self.logger.info("Wake triggered → GREETING")
+        with self._lock:
+            if self._state in (
+                ConvState.WAKE_LISTENING,
+                ConvState.IDLE,
+                ConvState.CONVERSATION_END,
+            ):
+                self._log.info("Wake triggered")
                 self._set_state(ConvState.GREETING)
-                self._speech_ready.set()   # unblock _handle_wake_listening
+                self._speech_evt.set()   # unblock _state_wake_listening()
 
     def submit_text_command(self, text: str):
         """
-        Inject a text command from the GUI.
-        Handles all current states gracefully.
+        Inject a text command from the GUI input box.
+        Can be called in any state — skips the greeting.
+        Note: the GUI already rendered the user message in the chat box;
+        we only pass it to the state machine for execution here.
         """
         text = text.strip()
         if not text:
             return
-        with self._state_lock:
+
+        with self._lock:
             curr = self._state
 
+        # Wake from standby — jump straight to COMMAND_LISTENING (no greeting)
         if curr in (ConvState.WAKE_LISTENING, ConvState.IDLE, ConvState.CONVERSATION_END):
-            # Jump straight to COMMAND_LISTENING — skip greeting for text input
             self._set_state(ConvState.COMMAND_LISTENING)
-            self._inject_speech(text)
-        elif curr in (ConvState.COMMAND_LISTENING, ConvState.AWAITING_INPUT,
-                      ConvState.GREETING):
-            self._inject_speech(text)
+
+        # Inject into the speech slot so the current state picks it up
+        self._speech_text  = text
+        self._speech_error = None
+        self._speech_evt.set()
+
+    # ═══════════════════════════════════════════
+    # State machine loop
+    # ═══════════════════════════════════════════
+
+    def _loop(self):
+        self._set_state(ConvState.WAKE_LISTENING)
+        self._cb_status("👂 Listening for 'Hey Friday'…")
+
+        while self._running:
+            s = self._state
+            if   s == ConvState.WAKE_LISTENING:    self._state_wake_listening()
+            elif s == ConvState.GREETING:           self._state_greeting()
+            elif s == ConvState.COMMAND_LISTENING:  self._state_command_listening()
+            elif s == ConvState.PROCESSING:         self._state_processing()
+            elif s == ConvState.AWAITING_INPUT:     self._state_awaiting_input()
+            elif s == ConvState.EXECUTING:          time.sleep(0.05)
+            elif s == ConvState.CONVERSATION_END:   self._state_end()
+            else:                                   time.sleep(0.1)
+
+    # ═══════════════════════════════════════════
+    # State handlers
+    # ═══════════════════════════════════════════
+
+    def _state_wake_listening(self):
+        """
+        Standby. Parks with near-zero CPU until WakeWordDetector fires
+        trigger_wake() which sets state→GREETING and fires _speech_evt.
+        """
+        self._speech_evt.clear()
+        self._speech_evt.wait(timeout=1.0)
+
+    def _state_greeting(self):
+        """
+        Respond to wake word.
+        TTS is BLOCKING: mic must NOT open while Friday is still speaking
+        or it will hear its own voice as a command.
+        """
+        self._fail_count = 0
+        self.bus.set_block(True)
+        self.bus.say("Hey there. How can I help you?")
+        # After greeting finishes, use non-blocking TTS for responses
+        self.bus.set_block(False)
+        self._cb_status("🎙️ Listening for your command…")
+        self._set_state(ConvState.COMMAND_LISTENING)
+
+    def _state_command_listening(self):
+        """
+        Open mic, wait for one command.
+
+        After a successful command is executed, this state is re-entered
+        automatically — the conversation CONTINUES until:
+          • user says an exit phrase → _state_do_exit()
+          • COMMAND_LISTEN_TIMEOUT seconds of silence → standby
+          • MAX_FAILURES consecutive recognition errors → standby
+        """
+        self._reset_speech()
+        self._cb_status("🎙️ Listening… (say 'Friday exit' to stop)")
+
+        # Start microphone capture on background thread
+        self._open_mic()
+
+        # Block until voice thread delivers a result (or timeout)
+        got = self._speech_evt.wait(timeout=COMMAND_LISTEN_TIMEOUT)
+
+        # ── Hard timeout: no audio activity at all ────────────────────
+        if not got or (self._speech_text is None and self._speech_error is None):
+            self.bus.set_block(False)
+            self.bus.say(
+                "I haven't heard anything for a while. Going back to standby. "
+                "Say Hey Friday to wake me."
+            )
+            self._set_state(ConvState.CONVERSATION_END)
+            return
+
+        # ── Speech recognition failed ─────────────────────────────────
+        if self._speech_error and self._speech_text is None:
+            self._fail_count += 1
+            self._log.warning("Recognition failure #%d: %s", self._fail_count, self._speech_error)
+
+            if self._fail_count >= MAX_FAILURES:
+                self.bus.set_block(False)
+                self.bus.say(
+                    "I'm having trouble hearing you. Going back to standby."
+                )
+                self._set_state(ConvState.CONVERSATION_END)
+            else:
+                # Retry — speak error then loop back to COMMAND_LISTENING
+                self.bus.set_block(True)
+                self.bus.say("I didn't catch that. Please try again.")
+                self.bus.set_block(False)
+                # State stays COMMAND_LISTENING — loop repeats
+            return
+
+        # ── Good speech received ──────────────────────────────────────
+        self._fail_count = 0
+        text = self._speech_text.strip()
+        self._log.info("Command heard: '%s'", text)
+
+        # Drop wake-word audio bleed silently
+        if text.lower() in IGNORE_PHRASES:
+            self._log.debug("Ignoring artefact: '%s'", text)
+            return  # stay in COMMAND_LISTENING
+
+        # Route user speech through the bus (logged + displayed, not spoken)
+        self.bus.user(text)
+
+        # Check for exit phrase
+        if self._is_exit(text):
+            self._state_do_exit()
+            return
+
+        # Move to processing
+        with self._lock:
+            self._pending_cmd = text
+            self._set_state(ConvState.PROCESSING)
+
+    def _state_processing(self):
+        """Route command: ask for confirmation if dangerous, else execute."""
+        cmd = self._pending_cmd
+        if not cmd:
+            self._set_state(ConvState.COMMAND_LISTENING)
+            return
+
+        self._cb_status(f"⏳ Processing: {cmd[:50]}…")
+
+        if self._needs_confirm(cmd):
+            self.bus.set_block(True)
+            self.bus.say("This action requires confirmation. Should I go ahead?")
+            self.bus.set_block(False)
+            with self._lock:
+                self._pending_ctx = "confirm"
+                self._set_state(ConvState.AWAITING_INPUT)
         else:
-            # During PROCESSING / EXECUTING — queue for when we return
-            self._inject_speech(text)
+            self._execute(cmd)
 
-    # ------------------------------------------------------------------ #
+    def _state_awaiting_input(self):
+        """Wait for a yes/no confirmation answer."""
+        self._reset_speech()
+        self._cb_status("🎙️ Waiting for your answer…")
+        self._open_mic()
 
-    def _inject_speech(self, text: str):
-        self._speech_result = text
-        self._speech_error  = None
-        self._speech_ready.set()
+        got = self._speech_evt.wait(timeout=FOLLOWUP_LISTEN_TIMEOUT)
 
-    # ================================================================== #
-    # State helpers
-    # ================================================================== #
+        if not got or self._speech_text is None:
+            self.bus.set_block(False)
+            self.bus.say("I didn't hear an answer. Cancelling.")
+            with self._lock:
+                self._pending_cmd = None
+                self._pending_ctx = None
+                self._set_state(ConvState.COMMAND_LISTENING)
+            return
 
-    def _set_state(self, new_state: ConvState):
+        answer = self._speech_text.strip()
+        self.bus.user(answer)
+        self._log.info("Confirmation answer: '%s'", answer)
+
+        if self._pending_ctx == "confirm":
+            if self._is_yes(answer):
+                self.bus.set_block(True)
+                self.bus.say("Got it, executing now.")
+                self.bus.set_block(False)
+                self._execute(self._pending_cmd)
+            elif self._is_no(answer):
+                self.bus.set_block(False)
+                self.bus.say("Understood, cancelling that action.")
+                with self._lock:
+                    self._pending_cmd = None
+                    self._pending_ctx = None
+                    self._set_state(ConvState.COMMAND_LISTENING)
+            else:
+                self.bus.set_block(True)
+                self.bus.say("Sorry, please say yes or no.")
+                self.bus.set_block(False)
+                # Stay in AWAITING_INPUT — loop re-enters
+        else:
+            combined = f"{self._pending_cmd} {answer}"
+            self._pending_cmd = combined
+            self._pending_ctx = None
+            self._execute(combined)
+
+    def _state_end(self):
+        """Transition from CONVERSATION_END back to WAKE_LISTENING."""
+        self._cb_status("👂 Listening for 'Hey Friday'…")
+        self._set_state(ConvState.WAKE_LISTENING)
+
+    # ═══════════════════════════════════════════
+    # Command execution
+    # ═══════════════════════════════════════════
+
+    def _execute(self, cmd_text: str):
+        """
+        Run command via FridayAssistant and dispatch the response.
+
+        assistant._conv_active = True suppresses the legacy GUI callback
+        so the response never appears twice in the chat window.
+
+        CRITICAL: After execution we return to COMMAND_LISTENING, not to
+        standby. The conversation continues until the user exits.
+        """
+        self._set_state(ConvState.EXECUTING)
+        self._cb_status("⚙️ Executing…")
+
+        try:
+            self.asst._conv_active = True
+            result = self.asst.process_command(cmd_text)
+            response = result.message
+
+            # Single dispatch call → log + GUI display + TTS voice
+            self.bus.set_block(False)
+            self.bus.say(response)
+
+        except Exception as exc:
+            self._log.error("Execute error for '%s': %s", cmd_text, exc, exc_info=True)
+            self.bus.set_block(False)
+            self.bus.say("Something went wrong. Please try a different command.")
+
+        finally:
+            self.asst._conv_active = False
+            with self._lock:
+                self._pending_cmd = None
+                self._pending_ctx = None
+                # *** Return to COMMAND_LISTENING — conversation continues ***
+                self._set_state(ConvState.COMMAND_LISTENING)
+            self._cb_status("🎙️ What else can I do? (say 'Friday exit' to stop)")
+
+    # ═══════════════════════════════════════════
+    # Exit
+    # ═══════════════════════════════════════════
+
+    def _state_do_exit(self):
+        self.bus.set_block(False)
+        self.bus.say("Going back to standby. Say 'Hey Friday' whenever you need me.")
+        self._cb_status("👂 Listening for 'Hey Friday'…")
+        with self._lock:
+            self._pending_cmd = None
+            self._pending_ctx = None
+            self._set_state(ConvState.CONVERSATION_END)
+
+    # ═══════════════════════════════════════════
+    # Voice capture helpers
+    # ═══════════════════════════════════════════
+
+    def _reset_speech(self):
+        self._speech_text  = None
+        self._speech_error = None
+        self._speech_evt.clear()
+
+    def _open_mic(self):
+        """
+        Start one capture cycle on the Friday-Voice thread.
+        Results land in _on_voice_ok / _on_voice_err.
+        If voice is unavailable, the GUI text box is the fallback.
+        """
+        if self.voice and self.voice.is_available:
+            self.voice.listen_once_with_callbacks(
+                on_result=self._on_voice_ok,
+                on_error=self._on_voice_err,
+            )
+
+    def _on_voice_ok(self, text: str):
+        """Called by Friday-Voice thread — recognition succeeded."""
+        self._speech_text  = text
+        self._speech_error = None
+        self._speech_evt.set()
+
+    def _on_voice_err(self, error: str):
+        """Called by Friday-Voice thread — recognition failed / timed out."""
+        self._speech_error = error
+        self._speech_text  = None
+        self._speech_evt.set()
+
+    # ═══════════════════════════════════════════
+    # State helper
+    # ═══════════════════════════════════════════
+
+    def _set_state(self, new: ConvState):
         old = self._state
-        self._state = new_state
-        if old != new_state:
-            self.logger.info("State  %s → %s", old.name, new_state.name)
-            self._on_state_change(new_state)
+        self._state = new
+        if old != new:
+            self._log.info("State: %s → %s", old.name, new.name)
+            self._cb_state(new)
 
     @property
     def state(self) -> ConvState:
         return self._state
 
-    # ================================================================== #
-    # Main loop
-    # ================================================================== #
-
-    def _main_loop(self):
-        self._set_state(ConvState.WAKE_LISTENING)
-        self._on_status("👂 Listening for 'Hey Friday'…")
-
-        while self._running:
-            s = self._state
-
-            if   s == ConvState.WAKE_LISTENING:    self._handle_wake_listening()
-            elif s == ConvState.GREETING:           self._handle_greeting()
-            elif s == ConvState.COMMAND_LISTENING:  self._handle_command_listening()
-            elif s == ConvState.PROCESSING:         self._handle_processing()
-            elif s == ConvState.AWAITING_INPUT:     self._handle_awaiting_input()
-            elif s == ConvState.EXECUTING:          time.sleep(0.05)
-            elif s == ConvState.CONVERSATION_END:   self._handle_conversation_end()
-            else:                                   time.sleep(0.1)
-
-    # ================================================================== #
-    # State handlers
-    # ================================================================== #
-
-    def _handle_wake_listening(self):
-        """
-        Idle standby.  WakeWordDetector fires trigger_wake() on its own
-        thread → sets state to GREETING and fires _speech_ready.
-        We just park here until that happens (1-second poll keeps CPU near 0%).
-        """
-        self._speech_ready.clear()
-        self._speech_ready.wait(timeout=1.0)
-
-    def _handle_greeting(self):
-        """Wake word detected — greet user and move to COMMAND_LISTENING."""
-        greeting = "Hey there, how can I help you?"
-        self._say(greeting)
-        self._on_assistant_speech(greeting)
-        self._on_status("🎙️ Listening for your command…")
-        with self._state_lock:
-            self._set_state(ConvState.COMMAND_LISTENING)
-
-    def _handle_command_listening(self):
-        """
-        Listen for one command.
-        - Stays here after execution (no auto-return to standby).
-        - Returns to WAKE_LISTENING only on timeout or exit phrase.
-        - Silently ignores wake-word artefacts.
-        """
-        self._speech_ready.clear()
-        self._speech_result = None
-        self._speech_error  = None
-        self._on_status("🎙️ Listening… (say 'Friday exit' to stop)")
-
-        # Start mic capture
-        if self.voice and self.voice.is_available:
-            self.voice.listen_once_with_callbacks(
-                on_result=self._on_voice_result,
-                on_error=self._on_voice_error,
-            )
-
-        # Wait for speech (or timeout → go to standby)
-        listen_timeout = self.config.get("speech_timeout", 6) + CONVERSATION_IDLE_TIMEOUT
-        got_input = self._speech_ready.wait(timeout=listen_timeout)
-
-        if not got_input or self._speech_result is None:
-            # True timeout — politely end conversation
-            msg = "I haven't heard anything for a while. Going back to standby. Say 'Hey Friday' to wake me."
-            self._say(msg)
-            self._on_assistant_speech(msg)
-            self._set_state(ConvState.CONVERSATION_END)
-            return
-
-        text = self._speech_result.strip()
-        self.logger.info("Command received: '%s'", text)
-
-        # ---- FIX 2: ignore wake-word artefacts ----
-        if text.lower() in IGNORE_PHRASES:
-            self.logger.debug("Ignoring wake-word artefact: '%s'", text)
-            # Stay in COMMAND_LISTENING — loop round immediately
-            return
-
-        self._on_user_speech(text)
-
-        # Check for exit
-        if self._is_exit_command(text):
-            self._handle_exit()
-            return
-
-        # Move to processing
-        with self._state_lock:
-            self._pending_command = text
-            self._set_state(ConvState.PROCESSING)
-
-    def _handle_processing(self):
-        """Check if confirmation needed, then execute or ask."""
-        cmd_text = self._pending_command
-        if not cmd_text:
-            self._set_state(ConvState.COMMAND_LISTENING)
-            return
-
-        self._on_status(f"⏳ Processing: {cmd_text[:50]}…")
-
-        if self._needs_confirmation(cmd_text):
-            prompt = "This action requires confirmation. Should I proceed?"
-            self._say(prompt)
-            self._on_assistant_speech(prompt)
-            with self._state_lock:
-                self._pending_prompt = "confirmation"
-                self._set_state(ConvState.AWAITING_INPUT)
-        else:
-            self._execute_command(cmd_text)
-
-    def _handle_awaiting_input(self):
-        """Wait for yes/no or a follow-up answer."""
-        self._speech_ready.clear()
-        self._speech_result = None
-        self._speech_error  = None
-        self._on_status("🎙️ Awaiting your answer…")
-
-        if self.voice and self.voice.is_available:
-            self.voice.listen_once_with_callbacks(
-                on_result=self._on_voice_result,
-                on_error=self._on_voice_error,
-            )
-
-        got_input = self._speech_ready.wait(timeout=14)
-
-        if not got_input or self._speech_result is None:
-            self._say("I didn't hear a response. Cancelling.")
-            self._on_assistant_speech("I didn't hear a response. Cancelling.")
-            with self._state_lock:
-                self._pending_command = None
-                self._pending_prompt  = None
-                self._set_state(ConvState.COMMAND_LISTENING)
-            return
-
-        answer = self._speech_result.strip()
-        self._on_user_speech(answer)
-        self.logger.info("Follow-up answer: '%s'", answer)
-
-        if self._pending_prompt == "confirmation":
-            if self._is_yes(answer):
-                ack = "Got it, executing now."
-                self._say(ack)
-                self._on_assistant_speech(ack)
-                self._execute_command(self._pending_command)
-            elif self._is_no(answer):
-                msg = "Understood, cancelling that action."
-                self._say(msg)
-                self._on_assistant_speech(msg)
-                with self._state_lock:
-                    self._pending_command = None
-                    self._pending_prompt  = None
-                    self._set_state(ConvState.COMMAND_LISTENING)
-            else:
-                msg = "I couldn't understand. Please say yes or no."
-                self._say(msg)
-                self._on_assistant_speech(msg)
-                # Stay in AWAITING_INPUT — loop will re-enter here
-        else:
-            # Generic follow-up: append answer to original command
-            combined = f"{self._pending_command} {answer}"
-            self._pending_command = combined
-            self._pending_prompt  = None
-            self._execute_command(combined)
-
-    def _handle_conversation_end(self):
-        """Transition back to WAKE_LISTENING."""
-        self._on_status("👂 Listening for 'Hey Friday'…")
-        with self._state_lock:
-            self._set_state(ConvState.WAKE_LISTENING)
-
-    # ================================================================== #
-    # Command execution
-    # ================================================================== #
-
-    def _execute_command(self, cmd_text: str):
-        """
-        Execute via FridayAssistant, speak + display the result.
-
-        FIX 1 — double response:
-        We call assistant.process_command() directly (synchronous).
-        This fires the assistant's internal _response_callback which the GUI
-        wired to _on_result_legacy.  To prevent the response appearing twice,
-        the GUI's _on_result_legacy checks whether the ConvMgr is active and
-        skips display when we are handling the response here ourselves.
-        We signal this by setting assistant._conv_active = True before the
-        call and False after.
-        """
-        with self._state_lock:
-            self._set_state(ConvState.EXECUTING)
-        self._on_status("⚙️ Executing…")
-
-        try:
-            # Signal to assistant that ConvMgr is handling display
-            self.assistant._conv_active = True
-
-            result = self.assistant.process_command(cmd_text)
-            response = result.message
-
-            # Display + speak the response (single source of truth)
-            self._on_assistant_speech(response)
-            self._say(response)
-
-        except Exception as exc:
-            err = f"Something went wrong: {exc}"
-            self.logger.error("Execute error: %s", exc, exc_info=True)
-            self._on_assistant_speech(err)
-            self._say(err)
-
-        finally:
-            self.assistant._conv_active = False
-            with self._state_lock:
-                self._pending_command = None
-                self._pending_prompt  = None
-                # ---- FIX 3: stay in COMMAND_LISTENING after each command ----
-                self._set_state(ConvState.COMMAND_LISTENING)
-            self._on_status("🎙️ What else can I do for you? (say 'Friday exit' to stop)")
-
-    # ================================================================== #
-    # Exit
-    # ================================================================== #
-
-    def _handle_exit(self):
-        bye = "Okay, going back to standby. Say 'Hey Friday' whenever you need me."
-        self._say(bye)
-        self._on_assistant_speech(bye)
-        self._on_status("👂 Listening for 'Hey Friday'…")
-        with self._state_lock:
-            self._pending_command = None
-            self._pending_prompt  = None
-            self._set_state(ConvState.CONVERSATION_END)
-
-    # ================================================================== #
-    # Speech I/O
-    # ================================================================== #
-
-    def _say(self, text: str):
-        self.logger.info("FRIDAY says: %s", text[:120])
-        if self.tts and self.tts.is_available:
-            self.tts.speak(text)
-
-    def _on_voice_result(self, text: str):
-        self._speech_result = text
-        self._speech_error  = None
-        self._speech_ready.set()
-
-    def _on_voice_error(self, error: str):
-        self._speech_error  = error
-        self._speech_result = None
-        self._speech_ready.set()
-
-    # ================================================================== #
-    # Decision helpers
-    # ================================================================== #
+    # ═══════════════════════════════════════════
+    # Phrase helpers
+    # ═══════════════════════════════════════════
 
     @staticmethod
-    def _needs_confirmation(text: str) -> bool:
+    def _needs_confirm(text: str) -> bool:
         t = text.lower()
         return any(kw in t for kw in CONFIRMATION_TRIGGERS)
 
     @staticmethod
-    def _is_exit_command(text: str) -> bool:
+    def _is_exit(text: str) -> bool:
         t = text.lower().strip()
-        return any(phrase in t for phrase in EXIT_PHRASES)
+        return any(p in t for p in EXIT_PHRASES)
 
     @staticmethod
     def _is_yes(text: str) -> bool:
