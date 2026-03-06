@@ -106,10 +106,7 @@ class MessageBus:
     def say(self, text: str, *, block: Optional[bool] = None) -> None:
         """Dispatch as FRIDAY — spoken + logged + displayed."""
 
-        # ensure voice output always happens
-        if block is None:
-            block = False
-
+        # Respect global block mode set by ConversationManager
         self.dispatch("FRIDAY", text, block=block)
 
     def user(self, text: str) -> None:

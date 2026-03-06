@@ -254,6 +254,7 @@ class ConversationManager:
         or it will hear its own voice as a command.
         """
         self._fail_count = 0
+        self.bus.clear_queue()
         self.bus.set_block(True)
         self.bus.say("Hey there. How can I help you?")
         # After greeting finishes, use non-blocking TTS for responses
@@ -283,13 +284,12 @@ class ConversationManager:
         got = self._speech_evt.wait(timeout=COMMAND_LISTEN_TIMEOUT)
 
         # ── Hard timeout: no audio activity at all ────────────────────
+        # Hard timeout: no audio activity
         if not got or (self._speech_text is None and self._speech_error is None):
             self.bus.set_block(False)
-            self.bus.say(
-                "I haven't heard anything for a while. Going back to standby. "
-                "Say Hey Friday to wake me."
-            )
-            self._set_state(ConvState.CONVERSATION_END)
+
+        # Stay active and continue listening instead of going to standby
+            self._set_state(ConvState.COMMAND_LISTENING)
             return
 
         # ── Speech recognition failed ─────────────────────────────────
@@ -344,6 +344,7 @@ class ConversationManager:
         self._cb_status(f"⏳ Processing: {cmd[:50]}…")
 
         if self._needs_confirm(cmd):
+            self.bus.clear_queue()
             self.bus.set_block(True)
             self.bus.say("This action requires confirmation. Should I go ahead?")
             self.bus.set_block(False)
@@ -431,6 +432,7 @@ class ConversationManager:
             # Speak the full answer before opening the microphone again,
             # so conversations feel natural and Friday does not capture its
             # own TTS output as the next command.
+            self.bus.clear_queue()     # <-- ADD THIS
             self.bus.set_block(True)
             self.bus.say(response)
             self.bus.set_block(False)
@@ -454,6 +456,7 @@ class ConversationManager:
     # ═══════════════════════════════════════════
 
     def _state_do_exit(self):
+        self.bus.clear_queue()
         self.bus.set_block(True)
         self.bus.say(
             "Going to standby voice mode. I will keep listening in the background. "
