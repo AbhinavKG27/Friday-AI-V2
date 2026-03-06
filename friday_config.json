@@ -28,5 +28,9 @@
   ],
 
   "browser_path": "",
-  "text_editor_path": ""
+  "text_editor_path": "",
+
+  "tts_rate": 175,
+  "tts_volume": 0.95,
+  "tts_voice_gender": "female"
 }

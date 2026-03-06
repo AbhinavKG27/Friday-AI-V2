@@ -26,7 +26,7 @@ python -m pip install --upgrade pip
 
 echo.
 echo [2/3] Installing core dependencies...
-pip install SpeechRecognition psutil Pillow
+pip install SpeechRecognition psutil Pillow pyttsx3
 
 echo.
 echo [3/3] Installing PyAudio...

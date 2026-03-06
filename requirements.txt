@@ -4,6 +4,9 @@
 # ---- Core (required) ----
 # tkinter is bundled with Python – no pip install needed
 
+# ---- Text-to-Speech (offline, required for voice output) ----
+pyttsx3>=2.90                  # Offline TTS using Windows SAPI / eSpeak
+
 # ---- Voice Input ----
 SpeechRecognition>=3.10.0      # Microphone capture + speech-to-text
 pyaudio>=0.2.14                # Audio I/O (required by SpeechRecognition)
