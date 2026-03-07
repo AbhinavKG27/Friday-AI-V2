@@ -317,6 +317,7 @@ class FridayApp:
             rate=self.config.get("tts_rate", 175),
             volume=self.config.get("tts_volume", 0.95),
             voice_gender=self.config.get("tts_voice_gender", "female"),
+            enabled=self.config.get("enable_voice_output", True),
         )
         # Update TTS indicator
         if self._tts.is_available:

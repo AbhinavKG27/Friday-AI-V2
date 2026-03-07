@@ -23,144 +23,187 @@ speak(text, block=False)  [default]
 
 AVAILABILITY CHECK
 ------------------
-TextToSpeech.is_available is False when pyttsx3 is not installed.
+TextToSpeech.is_available is False when no TTS backend is available.
 All speak() calls are silently no-ops in that case, so the rest of
-the codebase never needs to guard against a missing TTS.
+codebase never needs to guard against missing TTS.
 """
 
 import logging
-import threading
+import os
 import queue
 import re
+import shutil
+import subprocess
+import threading
 import unicodedata
-from typing import Optional, Callable
+from typing import Callable, Optional
 
-
-# ─────────────────────────────────────────────────
-# Text sanitiser — strips symbols that sound bad
-# ─────────────────────────────────────────────────
 
 _CLEAN = [
-    (re.compile(r"[●•◈▶►→↓↑◀▸\-\*#]"),      " "),
-    (re.compile(r"[\U0001F300-\U0001FAFF]"),  " "),   # emoji
-    (re.compile(r"─{2,}"),                    " "),
-    (re.compile(r"\n+"),                      ". "),
-    (re.compile(r"\s{2,}"),                   " "),
-    (re.compile(r"\s+([,\.!?])\s*"),          r"\1 "),
+    (re.compile(r"[●•◈▶►→↓↑◀▸\-\*#]"), " "),
+    (re.compile(r"[\U0001F300-\U0001FAFF]"), " "),  # emoji
+    (re.compile(r"─{2,}"), " "),
+    (re.compile(r"\n+"), ". "),
+    (re.compile(r"\s{2,}"), " "),
+    (re.compile(r"\s+([,\.!?])\s*"), r"\1 "),
 ]
 
-_PUNCT_TRANSLATE = str.maketrans({
-    "…": "...",
-    "’": "'",
-    "‘": "'",
-    "“": '"',
-    "”": '"',
-    "–": "-",
-    "—": "-",
-})
+_PUNCT_TRANSLATE = str.maketrans(
+    {
+        "…": "...",
+        "’": "'",
+        "‘": "'",
+        "“": '"',
+        "”": '"',
+        "–": "-",
+        "—": "-",
+    }
+)
+
 
 def _clean(text: str) -> str:
     text = text.translate(_PUNCT_TRANSLATE)
     for pat, rep in _CLEAN:
         text = pat.sub(rep, text)
-    # pyttsx3/SAPI can fail on some Unicode symbols depending on voice pack.
-    # Force a plain-ASCII fallback so command replies are always spoken.
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip(" .")
 
 
-# ─────────────────────────────────────────────────
-# TextToSpeech
-# ─────────────────────────────────────────────────
-
 class TextToSpeech:
-    """
-    Thread-safe pyttsx3 wrapper.
+    """Thread-safe TTS wrapper with pyttsx3 primary backend + OS fallback."""
 
-    Parameters
-    ----------
-    rate         : int    words per minute  (default 170)
-    volume       : float  0.0–1.0           (default 0.95)
-    voice_gender : str    "female" | "male" (default "female")
-    on_start     : Callable[[str], None]  — fired when an utterance starts
-    on_finish    : Callable[[], None]     — fired when an utterance ends
-    """
-
-    BLOCK_TIMEOUT = 60   # maximum seconds to wait on a blocking speak()
+    BLOCK_TIMEOUT = 60
 
     def __init__(
         self,
-        rate:         int   = 170,
-        volume:       float = 0.95,
-        voice_gender: str   = "female",
-        on_start:     Optional[Callable[[str], None]] = None,
-        on_finish:    Optional[Callable[[], None]]    = None,
+        rate: int = 170,
+        volume: float = 0.95,
+        voice_gender: str = "female",
+        enabled: bool = True,
+        on_start: Optional[Callable[[str], None]] = None,
+        on_finish: Optional[Callable[[], None]] = None,
     ):
-        self._log         = logging.getLogger("Friday.TTS")
-        self.rate         = rate
-        self.volume       = volume
+        self._log = logging.getLogger("Friday.TTS")
+        self.rate = rate
+        self.volume = volume
         self.voice_gender = voice_gender
-        self._on_start    = on_start
-        self._on_finish   = on_finish
+        self.enabled = enabled
+        self._on_start = on_start
+        self._on_finish = on_finish
 
-        self._available   = False
+        self._available = False
+        self._backend: Optional[str] = None
+        self._fallback_cmd: Optional[str] = None
+        self._reason: str = ""
         self._q: queue.Queue = queue.Queue()
-        self._stop        = threading.Event()
+        self._stop = threading.Event()
         self._worker: Optional[threading.Thread] = None
 
         self._init()
 
-    # ─────────────────────────────────────────────
-    # Initialisation
-    # ─────────────────────────────────────────────
+    @property
+    def is_available(self) -> bool:
+        return self._available
 
-    def _init(self):
-        try:
-            import pyttsx3
-            self._pyttsx3   = pyttsx3
-            self._available = True
-            self._log.info("pyttsx3 available — starting TTS worker")
-            self._worker = threading.Thread(
-                target=self._run, daemon=True, name="Friday-TTS"
-            )
-            self._worker.start()
-        except ImportError:
-            self._log.warning(
-                "pyttsx3 not installed — TTS disabled. "
-                "Run:  pip install pyttsx3"
-            )
+    @property
+    def backend(self) -> Optional[str]:
+        return self._backend
 
-    def _run(self):
-        """Worker thread: own the pyttsx3 engine for its entire lifetime."""
-        # ── Engine init ────────────────────────────────────────────────
-        try:
-            engine = self._pyttsx3.init()
-            engine.setProperty("rate",   self.rate)
-            engine.setProperty("volume", self.volume)
-            self._select_voice(engine)
-            self._log.info(
-                "TTS ready — voice=%s  rate=%d  volume=%.2f",
-                engine.getProperty("voice"), self.rate, self.volume,
-            )
-        except Exception as exc:
-            self._log.error("TTS engine init failed: %s", exc)
-            self._available = False
+    @property
+    def unavailable_reason(self) -> str:
+        return self._reason
+
+    def _init(self) -> None:
+        if not self.enabled:
+            self._reason = "disabled_by_config"
+            self._log.info("Voice output disabled by config (enable_voice_output=false)")
             return
 
-        # ── Processing loop ────────────────────────────────────────────
+        try:
+            import pyttsx3
+
+            self._pyttsx3 = pyttsx3
+            self._available = True
+            self._backend = "pyttsx3"
+            self._log.info("pyttsx3 available — starting TTS worker")
+            self._worker = threading.Thread(target=self._run_pyttsx3, daemon=True, name="Friday-TTS")
+            self._worker.start()
+        except ImportError as exc:
+            self._start_fallback_worker(f"pyttsx3 import failed: {exc}")
+
+    def _configure_fallback_backend(self) -> bool:
+        self._fallback_cmd = None
+
+        if os.name == "nt":
+            pwsh = shutil.which("pwsh")
+            powershell = shutil.which("powershell")
+            if pwsh:
+                self._backend = "pwsh"
+                self._fallback_cmd = pwsh
+                return True
+            if powershell:
+                self._backend = "powershell"
+                self._fallback_cmd = powershell
+                return True
+            self._reason = "windows_powershell_not_found"
+            return False
+
+        for cmd in ("say", "spd-say", "espeak"):
+            found = shutil.which(cmd)
+            if found:
+                self._backend = cmd
+                self._fallback_cmd = found
+                return True
+
+        self._reason = "no_fallback_backend_found"
+        return False
+
+    def _start_fallback_worker(self, reason: str, *, from_worker: bool = False) -> bool:
+        if not self._configure_fallback_backend():
+            self._available = False
+            self._reason = reason if not self._reason else f"{self._reason}; {reason}"
+            self._log.error("No TTS backend available: %s", self._reason)
+            return False
+
+        self._available = True
+        self._reason = ""
+        self._log.warning("Using fallback TTS backend '%s' (%s)", self._backend, reason)
+
+        if from_worker:
+            self._run_fallback()
+            return True
+
+        self._worker = threading.Thread(
+            target=self._run_fallback,
+            daemon=True,
+            name="Friday-TTS-Fallback",
+        )
+        self._worker.start()
+        return True
+
+    def _run_pyttsx3(self) -> None:
+        try:
+            engine = self._pyttsx3.init()
+            engine.setProperty("rate", self.rate)
+            engine.setProperty("volume", self.volume)
+            self._select_voice(engine)
+            self._log.info("TTS ready with pyttsx3")
+        except Exception as exc:
+            self._log.error("pyttsx3 init failed: %s", exc)
+            self._start_fallback_worker(f"pyttsx3 init failed: {exc}", from_worker=True)
+            return
+
         while not self._stop.is_set():
             try:
-                item = self._q.get(timeout=0.3)
+                text, done_evt = self._q.get(timeout=0.3)
             except queue.Empty:
                 continue
 
-            text, done_evt = item
-            if text is None:      # sentinel → shut down
+            if text is None:
                 break
 
             try:
-                self._log.debug("Speaking: %s", text[:100])
                 if self._on_start:
                     self._on_start(text)
                 engine.say(text)
@@ -168,7 +211,7 @@ class TextToSpeech:
                 if self._on_finish:
                     self._on_finish()
             except Exception as exc:
-                self._log.error("TTS speak error: %s", exc)
+                self._log.error("pyttsx3 speak error: %s", exc)
             finally:
                 if done_evt:
                     done_evt.set()
@@ -182,39 +225,79 @@ class TextToSpeech:
         except Exception:
             pass
 
-    def _select_voice(self, engine):
-        """Pick the best voice matching the requested gender."""
+    def _run_fallback(self) -> None:
+        while not self._stop.is_set():
+            try:
+                text, done_evt = self._q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+
+            if text is None:
+                break
+
+            try:
+                if self._on_start:
+                    self._on_start(text)
+                self._speak_with_fallback(text)
+                if self._on_finish:
+                    self._on_finish()
+            except Exception as exc:
+                self._log.error("Fallback TTS speak error: %s", exc)
+            finally:
+                if done_evt:
+                    done_evt.set()
+                try:
+                    self._q.task_done()
+                except ValueError:
+                    pass
+
+    def _speak_with_fallback(self, text: str) -> None:
+        if self._backend in {"pwsh", "powershell"} and self._fallback_cmd:
+            escaped = text.replace("'", "''")
+            script = (
+                "Add-Type -AssemblyName System.Speech; "
+                "$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                f"$speak.Speak('{escaped}')"
+            )
+            cp = subprocess.run(
+                [self._fallback_cmd, "-NoProfile", "-NonInteractive", "-Command", script],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode != 0:
+                raise RuntimeError(f"{self._backend} failed: {cp.stderr.strip() or cp.stdout.strip()}")
+            return
+
+        if self._backend in {"say", "spd-say", "espeak"} and self._fallback_cmd:
+            cp = subprocess.run(
+                [self._fallback_cmd, text],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode != 0:
+                raise RuntimeError(f"{self._backend} failed: {cp.stderr.strip() or cp.stdout.strip()}")
+            return
+
+        raise RuntimeError(f"Fallback backend not configured (backend={self._backend}, cmd={self._fallback_cmd})")
+
+    def _select_voice(self, engine) -> None:
         voices = engine.getProperty("voices") or []
-        female_kw = ["zira", "female", "woman", "helen", "eva",
-                     "susan", "hazel", "cortana"]
-        male_kw   = ["david", "male", "man", "mark", "george",
-                     "james", "richard"]
-        kws = female_kw if self.voice_gender == "female" else male_kw
-        for v in voices:
-            if any(k in (v.name or "").lower() for k in kws):
-                engine.setProperty("voice", v.id)
+        female_kw = ["zira", "female", "woman", "helen", "eva", "susan", "hazel", "cortana"]
+        male_kw = ["david", "male", "man", "mark", "george", "james", "richard"]
+        keywords = female_kw if self.voice_gender == "female" else male_kw
+        for voice in voices:
+            if any(k in (voice.name or "").lower() for k in keywords):
+                engine.setProperty("voice", voice.id)
                 return
         if voices:
             engine.setProperty("voice", voices[0].id)
 
-    # ─────────────────────────────────────────────
-    # Public API
-    # ─────────────────────────────────────────────
-
-    @property
-    def is_available(self) -> bool:
-        return self._available
-
     def speak(self, text: str, block: bool = False) -> None:
-        """
-        Queue text for speech synthesis.
-
-        block=True  — blocks caller until audio finishes.
-                      Required before opening the microphone.
-        block=False — returns immediately; audio plays asynchronously.
-        """
         if not self._available:
             return
+
         cleaned = _clean(text)
         if not cleaned:
             return
@@ -226,11 +309,9 @@ class TextToSpeech:
             done_evt.wait(timeout=self.BLOCK_TIMEOUT)
 
     def speak_async(self, text: str) -> None:
-        """Alias: speak(text, block=False)."""
         self.speak(text, block=False)
 
     def clear_queue(self) -> None:
-        """Discard all pending utterances (e.g. on sudden state change)."""
         while True:
             try:
                 self._q.get_nowait()
@@ -242,6 +323,5 @@ class TextToSpeech:
                 break
 
     def stop(self) -> None:
-        """Gracefully shut down the worker thread."""
         self._stop.set()
-        self._q.put((None, None))   # sentinel
+        self._q.put((None, None))
