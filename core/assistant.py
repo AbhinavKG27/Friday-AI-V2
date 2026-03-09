@@ -193,10 +193,7 @@ class FridayAssistant:
             return self.automation.open_app(cmd, "notepad")
 
         # ---- Unknown ----
-        return CommandResult.ok(
-            cmd,
-            "I don't know how to do that yet. Try saying 'what can you do' for a list of commands."
-        )
+        return self.automation.run_v1_engine(cmd)
 
     # ------------------------------------------------------------------ #
     # Sub-routers

@@ -20,7 +20,7 @@ import tkinter as tk
 from tkinter import scrolledtext, messagebox
 import logging
 from datetime import datetime
-
+from gui.visualizer import FridayVisualizer
 from utils.config import Config
 from models.command import CommandResult
 from core.conversation import ConvState
@@ -238,6 +238,11 @@ class FridayApp:
         )
         self._chat.grid(row=0, column=0, sticky="nsew")
 
+        # Visualizer panel (LEFT SIDE)
+        self._visualizer_frame = tk.Frame(cf, bg=C["bg"])
+        self._visualizer_frame.grid(row=0, column=1, sticky="nsew")
+        self._visualizer = FridayVisualizer(self._visualizer_frame)
+
         # Text tags
         for tag, fg, fnt in [
             ("ts",    C["muted"],   (F, 8)),
@@ -327,7 +332,9 @@ class FridayApp:
             self.root.after(0, self._tts_lbl.config,
                             {"text": "🔊 Voice Output: Disabled (install pyttsx3)",
                              "fg": C["red"]})
-
+        self._tts.set_speak_callback(
+            lambda: self.root.after(0, self._visualizer.boost_from_tts)
+        )
         # ── 2. MessageBus ─────────────────────────────────────────────────
         # gui_callback wraps _on_message in root.after for thread safety
         def gui_callback(source: str, text: str):
@@ -569,6 +576,8 @@ class FridayApp:
             self._conv_manager.stop()
         if self._tts:
             self._tts.stop()
+        if hasattr(self, "_visualizer"):
+            self._visualizer.stop()
         self.assistant.shutdown()
         self.root.destroy()
 

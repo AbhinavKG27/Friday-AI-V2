@@ -13,7 +13,7 @@ import platform
 import shutil
 from datetime import datetime
 from typing import Optional
-
+from automation.v1_engine import execute_task
 from utils.config import Config
 from utils.text_utils import clean_app_name
 from models.command import Command, CommandResult
@@ -261,3 +261,21 @@ class AutomationEngine:
             return CommandResult.ok(cmd, "📋 Clipboard cleared.")
         except Exception as e:
             return CommandResult.err(cmd, f"Clipboard clear failed: {e}")
+    def run_v1_logic(self, cmd: Command) -> CommandResult:
+        """
+        Fallback: run the original V1 command engine.
+        """
+        try:
+            execute_task(cmd.raw_text)
+            return CommandResult.ok(cmd, "Executed via legacy engine.")
+        except Exception as e:
+            return CommandResult.err(cmd, f"Legacy engine error: {e}")
+    def run_v1_engine(self, cmd: Command) -> CommandResult:
+        """
+        Runs the original V1 command engine.
+        """
+        try:
+            execute_task(cmd.raw_text)
+            return CommandResult.ok(cmd, "Executed via legacy engine.")
+        except Exception as e:
+            return CommandResult.err(cmd, f"V1 engine error: {e}")

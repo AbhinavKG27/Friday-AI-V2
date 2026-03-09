@@ -25,7 +25,9 @@ import threading
 import struct
 import time
 from typing import Callable, Optional
+from utils.path_utils import asset_path
 
+keyword_path = asset_path("hey_friday.ppn")
 
 SOFT_WAKE_PHRASES = {
     "hey friday",

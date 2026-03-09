@@ -91,7 +91,7 @@ class TextToSpeech:
         self.enabled = enabled
         self._on_start = on_start
         self._on_finish = on_finish
-
+        self.on_speak_callback = None
         self._available = False
         self._backend: Optional[str] = None
         self._fallback_cmd: Optional[str] = None
@@ -325,3 +325,9 @@ class TextToSpeech:
     def stop(self) -> None:
         self._stop.set()
         self._q.put((None, None))
+
+    def set_speak_callback(self, callback):
+        """
+        GUI can register a callback to react when TTS speaks.
+        """
+        self.on_speak_callback = callback
