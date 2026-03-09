@@ -7,6 +7,7 @@ import sys
 import os
 import threading
 import logging
+import tkinter as tk
 
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,8 +54,13 @@ def main():
     logger.info("Voice listener started")
 
     # Create and launch the GUI
-    app = FridayApp(assistant, config)
-    app.run()
+    try:
+        app = FridayApp(assistant, config)
+        app.run()
+    except tk.TclError as exc:
+        logger.warning("GUI unavailable in this environment: %s", exc)
+        assistant.shutdown()
+        return
 
     logger.info("Friday AI Assistant - Shutting Down")
 

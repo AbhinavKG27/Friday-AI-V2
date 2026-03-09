@@ -10,31 +10,60 @@ def send_command_to_frontend(text):
 import os
 import datetime
 import random
-import pyttsx3
-import psutil
+from difflib import SequenceMatcher
+try:
+    import pyttsx3
+except ImportError:
+    pyttsx3 = None
+try:
+    import psutil
+except ImportError:
+    psutil = None
 import time
 import shutil
 import glob
 import subprocess
 import socket
-import speech_recognition as sr
-import nltk
-from nltk.corpus import wordnet
-from rapidfuzz import fuzz
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
+try:
+    import nltk
+    from nltk.corpus import wordnet
+except ImportError:
+    nltk = None
+    wordnet = None
+try:
+    from rapidfuzz import fuzz
+except ImportError:
+    class _FallbackFuzz:
+        @staticmethod
+        def ratio(a, b):
+            return int(SequenceMatcher(None, a, b).ratio() * 100)
+    fuzz = _FallbackFuzz()
 import tkinter as tk   # ✅ added for GUI
-import pyautogui
+try:
+    import pyautogui
+except ImportError:
+    pyautogui = None
 
 # Initialize TTS
-engine = pyttsx3.init()
-voices = engine.getProperty('voices')
+engine = None
+if pyttsx3 is not None:
+    try:
+        engine = pyttsx3.init()
+        voices = engine.getProperty('voices')
 
-# Pick female voice
-for voice in voices:
-    if "female" in voice.name.lower() or "zira" in voice.name.lower():
-        engine.setProperty('voice', voice.id)
-        break
+        # Pick female voice
+        for voice in voices:
+            if "female" in voice.name.lower() or "zira" in voice.name.lower():
+                engine.setProperty('voice', voice.id)
+                break
 
-engine.setProperty('rate', 150)  # Optional: speech speed
+        engine.setProperty('rate', 150)  # Optional: speech speed
+    except Exception:
+        engine = None
 
 # List of greetings to detect
 greetings = [
@@ -48,13 +77,18 @@ greeting_replies = [
 ]
 
 def press_keys(key_string):
-    import pyautogui
+    if pyautogui is None:
+        speak("Keyboard automation is unavailable. Install pyautogui to use this feature.")
+        return
     keys = [k.strip() for k in key_string.lower().split('+')]
     speak(f"Pressing: {' + '.join(keys)}")
     pyautogui.hotkey(*keys)
 
 
 def define_word(word):
+    if wordnet is None:
+        speak("Dictionary support is unavailable. Install nltk to use this feature.")
+        return
     synsets = wordnet.synsets(word)
     if synsets:
         definition = synsets[0].definition()
@@ -130,6 +164,8 @@ def speak(text):
     except:
         pass
 
+    if engine is None:
+        return
     try:
         engine.say(text)
         engine.runAndWait()
@@ -137,6 +173,9 @@ def speak(text):
         print("TTS error:", e)
 
 def get_note_online():
+    if sr is None:
+        speak("Speech recognition is unavailable. Install SpeechRecognition and PyAudio.")
+        return None
     recognizer = sr.Recognizer()
     mic = sr.Microphone()
     for attempt in range(2):  # try twice
@@ -182,6 +221,9 @@ def execute_task(command):
 
     # ---------------------- Battery ----------------------
     elif "battery" in command:
+        if psutil is None:
+            speak("Battery status requires psutil. Install psutil to enable this feature.")
+            return
         battery = psutil.sensors_battery()
         if battery:
             speak(f"Battery is at {battery.percent} percent")

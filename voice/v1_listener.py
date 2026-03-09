@@ -1,5 +1,8 @@
-import speech_recognition as sr
 import threading
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
 
 from automation.v1_engine import execute_task, speak
 from core.message_bus import dispatch_message
@@ -8,11 +11,14 @@ from core.message_bus import dispatch_message
 class V1VoiceListener:
 
     def __init__(self):
-        self.recognizer = sr.Recognizer()
-        self.mic = sr.Microphone()
+        self.recognizer = sr.Recognizer() if sr else None
+        self.mic = sr.Microphone() if sr else None
         self.running = False
 
     def start(self):
+        if sr is None:
+            speak("Legacy voice listener unavailable. Install SpeechRecognition and PyAudio.")
+            return
         self.running = True
         threading.Thread(target=self._loop, daemon=True).start()
 

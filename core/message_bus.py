@@ -24,6 +24,23 @@ import logging
 from typing import Callable, Optional, Set
 
 
+_default_bus = None
+
+
+def set_default_bus(bus: "MessageBus") -> None:
+    """Register a process-wide default bus for legacy helpers."""
+    global _default_bus
+    _default_bus = bus
+
+
+def dispatch_message(source: str, text: str) -> None:
+    """Legacy compatibility shim used by v1 modules."""
+    if _default_bus is not None:
+        _default_bus.dispatch(source, text)
+    else:
+        logging.getLogger("Friday.MessageBus").info("[%s] %s", source, text)
+
+
 class MessageBus:
     """
     Central message hub.

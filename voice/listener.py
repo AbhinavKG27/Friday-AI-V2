@@ -28,6 +28,7 @@ DESIGN RULES
 
 import logging
 import threading
+import time
 from typing import Callable, Optional
 
 
@@ -93,16 +94,11 @@ class VoiceListener:
                 "Run:  pip install SpeechRecognition pyaudio"
             )
 
-    # ─────────────────────────────────────────────
-    # Public API
-    # ─────────────────────────────────────────────
-
     @property
     def is_available(self) -> bool:
         return self._available
 
     def listen_once(self) -> None:
-        """Legacy: uses the callbacks supplied at construction time."""
         self.listen_once_with_callbacks(
             on_result=self._def_result,
             on_error=self._def_error,
@@ -115,33 +111,18 @@ class VoiceListener:
         on_error:  Optional[Callable[[str], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
     ) -> None:
-        """
-        Start one capture cycle on a background thread (non-blocking).
-
-        Waits up to 1 second for any previous capture to finish before
-        starting, preventing silent dropped requests.
-
-        Callbacks fire on the Friday-Voice thread — if they update the
-        GUI they must use root.after(0, ...).
-        """
         if not self._available:
             if on_error:
-                on_error(
-                    "Voice input unavailable — "
-                    "run: pip install SpeechRecognition pyaudio"
-                )
+                on_error("Voice input unavailable — run: pip install SpeechRecognition pyaudio")
             return
 
         _err    = on_error  or (lambda m: None)
         _status = on_status or (lambda m: None)
 
         with self._t_lock:
-            # Serialise: wait briefly for the previous capture to end
             if self._thread and self._thread.is_alive():
-                self._log.debug("Waiting for previous capture thread…")
                 self._thread.join(timeout=1.0)
                 if self._thread.is_alive():
-                    self._log.warning("Capture thread still alive — skipping request")
                     _err("Microphone busy — please wait a moment.")
                     return
 
@@ -152,10 +133,6 @@ class VoiceListener:
                 name="Friday-Voice",
             )
             self._thread.start()
-
-    # ─────────────────────────────────────────────
-    # Capture implementation
-    # ─────────────────────────────────────────────
 
     def _capture(
         self,
@@ -168,7 +145,6 @@ class VoiceListener:
 
         try:
             with sr.Microphone() as source:
-                # Brief ambient-noise calibration
                 self._recognizer.adjust_for_ambient_noise(source, duration=0.3)
                 on_status("🎙️ Speak now…")
                 audio = self._recognizer.listen(
@@ -181,7 +157,6 @@ class VoiceListener:
             text = self._recognise(audio)
 
             if text:
-                self._log.info("Recognised: '%s'", text)
                 on_status("✅ Got it")
                 on_result(text)
             else:
@@ -203,13 +178,7 @@ class VoiceListener:
             self._log.exception("Unexpected voice capture error")
 
     def _recognise(self, audio) -> Optional[str]:
-        """
-        Try Google STT first (best accuracy, internet required).
-        Fall back to CMU Sphinx if Google is unreachable.
-        Returns None if both fail.
-        """
         sr = self._sr
-
         try:
             return self._recognizer.recognize_google(audio, language=self.language)
         except sr.UnknownValueError:
@@ -223,3 +192,26 @@ class VoiceListener:
             pass
 
         return None
+
+
+def listen_and_execute(assistant) -> None:
+    listener = VoiceListener()
+    if not listener.is_available:
+        return
+
+    done = threading.Event()
+
+    def _on_result(text: str):
+        try:
+            assistant.process_command(text)
+        finally:
+            done.set()
+
+    def _on_error(_msg: str):
+        done.set()
+
+    while True:
+        done.clear()
+        listener.listen_once_with_callbacks(on_result=_on_result, on_error=_on_error)
+        done.wait(timeout=max(listener.timeout + listener.phrase_limit + 2, 5))
+        time.sleep(0.1)

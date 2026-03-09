@@ -2,8 +2,14 @@ import tkinter as tk
 import math
 import random
 import threading
-import numpy as np
-import pyaudio
+try:
+    import numpy as np
+except ImportError:
+    np = None
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
 
 
 class FridayVisualizer:
@@ -33,7 +39,8 @@ class FridayVisualizer:
                 "length": 40
             })
 
-        threading.Thread(target=self._listen_mic, daemon=True).start()
+        if np is not None and pyaudio is not None:
+            threading.Thread(target=self._listen_mic, daemon=True).start()
         self._animate()
 
     def stop(self):
@@ -46,6 +53,8 @@ class FridayVisualizer:
         self.mic_level = max(self.mic_level, 2.5)
 
     def _listen_mic(self):
+        if np is None or pyaudio is None:
+            return
 
         CHUNK = 512
         FORMAT = pyaudio.paInt16

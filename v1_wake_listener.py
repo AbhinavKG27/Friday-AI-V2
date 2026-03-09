@@ -1,5 +1,11 @@
-import pvporcupine
-import pyaudio
+try:
+    import pvporcupine
+except ImportError:
+    pvporcupine = None
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
 import struct
 import sys
 import os
@@ -28,6 +34,9 @@ class V1WakeWordListener:
         self.running = False
 
     def start(self):
+        if pvporcupine is None or pyaudio is None:
+            print("Wake listener unavailable. Install pvporcupine and pyaudio.")
+            return
         self.running = True
         threading.Thread(target=self._listen_loop, daemon=True).start()
 
