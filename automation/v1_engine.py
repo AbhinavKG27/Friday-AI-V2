@@ -43,6 +43,7 @@ except ImportError:
             return int(SequenceMatcher(None, a, b).ratio() * 100)
     fuzz = _FallbackFuzz()
 import tkinter as tk   # ✅ added for GUI
+from voice.audio_input import AudioPhraseCapturer, AudioStreamingQueue
 try:
     import pyautogui
 except ImportError:
@@ -174,19 +175,28 @@ def speak(text):
 
 def get_note_online():
     if sr is None:
-        speak("Speech recognition is unavailable. Install SpeechRecognition and PyAudio.")
+        speak("Speech recognition is unavailable. Install SpeechRecognition and SoundDevice.")
         return None
+    stream = AudioStreamingQueue(sample_rate=16000)
+    if not stream.is_available:
+        speak("Microphone capture is unavailable. Install sounddevice.")
+        return None
+
+    capturer = AudioPhraseCapturer(stream)
     recognizer = sr.Recognizer()
-    mic = sr.Microphone()
+
     for attempt in range(2):  # try twice
         try:
-            with mic as source:
-                speak("What should I write?")
-                audio = recognizer.listen(source)
+            speak("What should I write?")
+            stream.start()
+            captured = capturer.capture_phrase(timeout=6, phrase_time_limit=12)
+            audio = sr.AudioData(captured.pcm, captured.sample_rate, sample_width=2)
             note = recognizer.recognize_google(audio)
             return note
         except Exception:
             speak("Sorry, I couldn't get that. Please say it again.")
+        finally:
+            stream.stop()
     return None
 
 # ✅ Offline dictionary
